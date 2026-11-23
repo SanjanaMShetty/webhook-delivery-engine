@@ -212,3 +212,66 @@ def get_event(event_id: UUID, tenant: CurrentTenant, db: DbSession) -> dict:
         "payload": event.payload,
         "created_at": event.created_at,
     }
+
+@router.post("/deliveries/{delivery_id}/replay", status_code=status.HTTP_202_ACCEPTED)
+def replay_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
+    """Start a fresh retry budget while preserving attempt history."""
+    row = db.scalar(select(Delivery).join(Event, Delivery.event_id == Event.id).where(
+        Delivery.id == delivery_id, Event.tenant_id == tenant.id
+    ).with_for_update())
+    if row is None:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    if row.status not in {"dead", "permanent_failure"}:
+        raise HTTPException(status_code=409, detail="Only failed deliveries can be replayed")
+    outbox = db.scalar(select(OutboxMessage).where(OutboxMessage.delivery_id == row.id).with_for_update())
+    if outbox is None:
+        raise HTTPException(status_code=500, detail="Delivery outbox record is missing")
+    now = datetime.now(timezone.utc)
+    row.status = "queued"
+    row.attempt_count = 0
+    row.next_attempt_at = now
+    row.last_error = None
+    row.last_status_code = None
+    row.delivered_at = None
+    outbox.status = "pending"
+    outbox.available_at = now
+    outbox.published_at = None
+    outbox.last_error = None
+    outbox.lease_owner = outbox.lease_token = outbox.lease_expires_at = None
+    db.commit()
+    return {"delivery_id": str(row.id), "status": row.status, "message": "Replay scheduled"}
+
+from app.models import DeliveryAttempt
+
+@router.get("/deliveries/{delivery_id}")
+def get_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
+    """Return tenant-scoped delivery state and its durable attempt history."""
+    delivery = db.scalar(select(Delivery).join(Event, Delivery.event_id == Event.id).where(
+        Delivery.id == delivery_id, Event.tenant_id == tenant.id
+    ))
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    attempts = db.scalars(select(DeliveryAttempt).where(
+        DeliveryAttempt.delivery_id == delivery.id
+    ).order_by(DeliveryAttempt.attempt_number)).all()
+    return {
+        "delivery_id": str(delivery.id),
+        "event_id": str(delivery.event_id),
+        "endpoint_id": str(delivery.endpoint_id),
+        "status": delivery.status,
+        "attempt_count": delivery.attempt_count,
+        "next_attempt_at": delivery.next_attempt_at,
+        "last_status_code": delivery.last_status_code,
+        "last_error": delivery.last_error,
+        "delivered_at": delivery.delivered_at,
+        "attempts": [{
+            "attempt_number": item.attempt_number,
+            "outcome": item.outcome,
+            "http_status_code": item.http_status_code,
+            "response_excerpt": item.response_excerpt,
+            "error": item.error,
+            "latency_ms": item.latency_ms,
+            "started_at": item.started_at,
+            "completed_at": item.completed_at,
+        } for item in attempts],
+    }

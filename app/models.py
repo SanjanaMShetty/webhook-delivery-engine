@@ -101,7 +101,7 @@ class Delivery(Base):
 
     __table_args__ = (
         UniqueConstraint("event_id", "endpoint_id", name="uq_deliveries_event_endpoint"),
-        CheckConstraint("status IN ('queued', 'retrying', 'delivered', 'dead', 'permanent_failure', 'paused')", name="ck_deliveries_status"),
+        CheckConstraint("status IN ('queued', 'processing', 'retrying', 'delivered', 'dead', 'permanent_failure', 'paused')", name="ck_deliveries_status"),
         Index("ix_deliveries_status_next_attempt", "status", "next_attempt_at"),
         Index("ix_deliveries_endpoint_status", "endpoint_id", "status"),
     )
