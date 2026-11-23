@@ -1,0 +1,42 @@
+
+## Phase 2: tenant API, endpoints, and event ingestion
+
+The API uses tenant-scoped bearer API keys. Create a local tenant and key after applying migrations:
+
+~~~bash
+python -m scripts.create_tenant "Local Demo"
+~~~
+
+Copy the one-time key from the terminal and keep it private. In that same WSL terminal, set it for your current shell session:
+
+~~~bash
+export WEBHOOK_API_KEY='paste-the-key-here'
+~~~
+
+Run the API:
+
+~~~bash
+uvicorn app.main:app --reload
+~~~
+
+Open <http://127.0.0.1:8000/docs> for the interactive API reference. Register an endpoint (use a receiver URL you control):
+
+~~~bash
+curl -X POST http://127.0.0.1:8000/v1/endpoints \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Order receiver","url":"https://example.com/webhook","event_types":["order.created"]}'
+~~~
+
+Submit an event:
+
+~~~bash
+curl -X POST http://127.0.0.1:8000/v1/events \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"evt-001","event_type":"order.created","payload":{"order_id":"ord-123"}}'
+~~~
+
+A successful request stores the event and, for each active matching endpoint, creates a queued delivery and its pending PostgreSQL outbox row in the same transaction. Repeating the same event_id and body returns the existing event and delivery IDs; reusing that ID with different event content returns HTTP 409. The background publisher and delivery worker are implemented in later phases.
+
+For local development, endpoint registration currently accepts HTTP and HTTPS URLs, and event types may include * to subscribe to all event types. Outbound URL safety checks and encrypted signing-secret management are later security/delivery work; do not use untrusted URLs or store signing secrets yet.
