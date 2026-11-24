@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -11,9 +11,16 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import CurrentTenant
 from app.database import get_db
-from app.models import Delivery, Event, OutboxMessage, Tenant, WebhookEndpoint
+from app.endpoint_protection import UnsafeDestination, validate_destination_url
+from app.models import Delivery, Event, OutboxMessage, WebhookEndpoint
+from app.schemas import (
+    EndpointCreate,
+    EndpointRead,
+    EndpointUpdate,
+    EventAccepted,
+    EventCreate,
+)
 from app.security import encrypt_secret
-from app.schemas import EndpointCreate, EndpointRead, EndpointUpdate, EventAccepted, EventCreate
 
 router = APIRouter(prefix="/v1")
 DbSession = Annotated[Session, Depends(get_db)]
@@ -31,18 +38,28 @@ def endpoint_response(endpoint: WebhookEndpoint) -> EndpointRead:
     )
 
 
-@router.post("/endpoints", response_model=EndpointRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/endpoints", response_model=EndpointRead, status_code=status.HTTP_201_CREATED
+)
 def create_endpoint(
     request: EndpointCreate,
     tenant: CurrentTenant,
     db: DbSession,
 ) -> EndpointRead:
+    try:
+        validate_destination_url(str(request.url))
+    except (UnsafeDestination, OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Unsafe or unresolvable webhook URL: {exc}"
+        ) from exc
     endpoint = WebhookEndpoint(
         tenant_id=tenant.id,
         name=request.name,
         url=str(request.url),
         event_types=request.event_types,
-        signing_secret_ciphertext=encrypt_secret(request.signing_secret.get_secret_value()),
+        signing_secret_ciphertext=encrypt_secret(
+            request.signing_secret.get_secret_value()
+        ),
         status="active",
     )
     db.add(endpoint)
@@ -62,7 +79,9 @@ def list_endpoints(tenant: CurrentTenant, db: DbSession) -> list[EndpointRead]:
 
 
 @router.get("/endpoints/{endpoint_id}", response_model=EndpointRead)
-def get_endpoint(endpoint_id: UUID, tenant: CurrentTenant, db: DbSession) -> EndpointRead:
+def get_endpoint(
+    endpoint_id: UUID, tenant: CurrentTenant, db: DbSession
+) -> EndpointRead:
     endpoint = db.scalar(
         select(WebhookEndpoint).where(
             WebhookEndpoint.id == endpoint_id,
@@ -92,25 +111,43 @@ def update_endpoint(
     changes = request.model_dump(exclude_unset=True)
     signing_secret = changes.pop("signing_secret", None)
     if signing_secret is not None:
-        changes["signing_secret_ciphertext"] = encrypt_secret(signing_secret.get_secret_value())
+        changes["signing_secret_ciphertext"] = encrypt_secret(
+            signing_secret.get_secret_value()
+        )
     if any(value is None for value in changes.values()):
         raise HTTPException(status_code=422, detail="Fields cannot be null")
     if not changes:
-        raise HTTPException(status_code=422, detail="Provide at least one field to update")
-    if "status" in changes and changes["status"] not in {"active", "suspended", "disabled"}:
-        raise HTTPException(status_code=422, detail="status must be active, suspended, or disabled")
+        raise HTTPException(
+            status_code=422, detail="Provide at least one field to update"
+        )
+    if "status" in changes and changes["status"] not in {
+        "active",
+        "suspended",
+        "disabled",
+    }:
+        raise HTTPException(
+            status_code=422, detail="status must be active, suspended, or disabled"
+        )
     if "url" in changes and changes["url"] is not None:
+        try:
+            validate_destination_url(str(changes["url"]))
+        except (UnsafeDestination, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Unsafe or unresolvable webhook URL: {exc}"
+            ) from exc
         changes["url"] = str(changes["url"])
     for field, value in changes.items():
         setattr(endpoint, field, value)
-    endpoint.updated_at = datetime.now(timezone.utc)
+    endpoint.updated_at = datetime.now(UTC)
     db.commit()
     db.refresh(endpoint)
     return endpoint_response(endpoint)
 
 
 @router.delete("/endpoints/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
-def disable_endpoint(endpoint_id: UUID, tenant: CurrentTenant, db: DbSession) -> Response:
+def disable_endpoint(
+    endpoint_id: UUID, tenant: CurrentTenant, db: DbSession
+) -> Response:
     endpoint = db.scalar(
         select(WebhookEndpoint).where(
             WebhookEndpoint.id == endpoint_id,
@@ -120,12 +157,14 @@ def disable_endpoint(endpoint_id: UUID, tenant: CurrentTenant, db: DbSession) ->
     if endpoint is None:
         raise HTTPException(status_code=404, detail="Endpoint not found")
     endpoint.status = "disabled"
-    endpoint.updated_at = datetime.now(timezone.utc)
+    endpoint.updated_at = datetime.now(UTC)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/events", response_model=EventAccepted, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/events", response_model=EventAccepted, status_code=status.HTTP_202_ACCEPTED
+)
 async def ingest_event(
     payload: EventCreate,
     request: Request,
@@ -158,14 +197,19 @@ async def ingest_event(
                 )
             )
             assert existing is not None
-            if existing.event_type != payload.event_type or existing.payload != payload.payload:
+            if (
+                existing.event_type != payload.event_type
+                or existing.payload != payload.payload
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail="event_id was already used with a different event body",
                 )
             event_id = existing.id
             delivery_ids = list(
-                db.scalars(select(Delivery.id).where(Delivery.event_id == event_id)).all()
+                db.scalars(
+                    select(Delivery.id).where(Delivery.event_id == event_id)
+                ).all()
             )
             return EventAccepted(
                 event_id=event_id,
@@ -188,7 +232,9 @@ async def ingest_event(
 
         delivery_ids: list[UUID] = []
         for endpoint in endpoints:
-            delivery = Delivery(event_id=event_id, endpoint_id=endpoint.id, status="queued")
+            delivery = Delivery(
+                event_id=event_id, endpoint_id=endpoint.id, status="queued"
+            )
             db.add(delivery)
             db.flush()
             db.add(OutboxMessage(delivery_id=delivery.id, status="pending"))
@@ -218,20 +264,30 @@ def get_event(event_id: UUID, tenant: CurrentTenant, db: DbSession) -> dict:
         "created_at": event.created_at,
     }
 
+
 @router.post("/deliveries/{delivery_id}/replay", status_code=status.HTTP_202_ACCEPTED)
 def replay_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
     """Start a fresh retry budget while preserving attempt history."""
-    row = db.scalar(select(Delivery).join(Event, Delivery.event_id == Event.id).where(
-        Delivery.id == delivery_id, Event.tenant_id == tenant.id
-    ).with_for_update())
+    row = db.scalar(
+        select(Delivery)
+        .join(Event, Delivery.event_id == Event.id)
+        .where(Delivery.id == delivery_id, Event.tenant_id == tenant.id)
+        .with_for_update()
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="Delivery not found")
     if row.status not in {"dead", "permanent_failure"}:
-        raise HTTPException(status_code=409, detail="Only failed deliveries can be replayed")
-    outbox = db.scalar(select(OutboxMessage).where(OutboxMessage.delivery_id == row.id).with_for_update())
+        raise HTTPException(
+            status_code=409, detail="Only failed deliveries can be replayed"
+        )
+    outbox = db.scalar(
+        select(OutboxMessage)
+        .where(OutboxMessage.delivery_id == row.id)
+        .with_for_update()
+    )
     if outbox is None:
         raise HTTPException(status_code=500, detail="Delivery outbox record is missing")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     row.status = "queued"
     row.attempt_count = 0
     row.next_attempt_at = now
@@ -244,21 +300,31 @@ def replay_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
     outbox.last_error = None
     outbox.lease_owner = outbox.lease_token = outbox.lease_expires_at = None
     db.commit()
-    return {"delivery_id": str(row.id), "status": row.status, "message": "Replay scheduled"}
+    return {
+        "delivery_id": str(row.id),
+        "status": row.status,
+        "message": "Replay scheduled",
+    }
+
 
 from app.models import DeliveryAttempt
+
 
 @router.get("/deliveries/{delivery_id}")
 def get_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
     """Return tenant-scoped delivery state and its durable attempt history."""
-    delivery = db.scalar(select(Delivery).join(Event, Delivery.event_id == Event.id).where(
-        Delivery.id == delivery_id, Event.tenant_id == tenant.id
-    ))
+    delivery = db.scalar(
+        select(Delivery)
+        .join(Event, Delivery.event_id == Event.id)
+        .where(Delivery.id == delivery_id, Event.tenant_id == tenant.id)
+    )
     if delivery is None:
         raise HTTPException(status_code=404, detail="Delivery not found")
-    attempts = db.scalars(select(DeliveryAttempt).where(
-        DeliveryAttempt.delivery_id == delivery.id
-    ).order_by(DeliveryAttempt.attempt_number)).all()
+    attempts = db.scalars(
+        select(DeliveryAttempt)
+        .where(DeliveryAttempt.delivery_id == delivery.id)
+        .order_by(DeliveryAttempt.attempt_number)
+    ).all()
     return {
         "delivery_id": str(delivery.id),
         "event_id": str(delivery.event_id),
@@ -269,14 +335,17 @@ def get_delivery(delivery_id: UUID, tenant: CurrentTenant, db: DbSession):
         "last_status_code": delivery.last_status_code,
         "last_error": delivery.last_error,
         "delivered_at": delivery.delivered_at,
-        "attempts": [{
-            "attempt_number": item.attempt_number,
-            "outcome": item.outcome,
-            "http_status_code": item.http_status_code,
-            "response_excerpt": item.response_excerpt,
-            "error": item.error,
-            "latency_ms": item.latency_ms,
-            "started_at": item.started_at,
-            "completed_at": item.completed_at,
-        } for item in attempts],
+        "attempts": [
+            {
+                "attempt_number": item.attempt_number,
+                "outcome": item.outcome,
+                "http_status_code": item.http_status_code,
+                "response_excerpt": item.response_excerpt,
+                "error": item.error,
+                "latency_ms": item.latency_ms,
+                "started_at": item.started_at,
+                "completed_at": item.completed_at,
+            }
+            for item in attempts
+        ],
     }

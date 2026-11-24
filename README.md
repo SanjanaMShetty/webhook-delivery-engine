@@ -65,3 +65,16 @@ Run a local receiver that returns HTTP 500 for its first two requests, then HTTP
     python scripts/failure_receiver.py --port 9001 --fail-first 2 --status 500
 
 Register http://127.0.0.1:9001/webhook as an endpoint subscribed to the test event type. Publish an event and inspect it with GET /v1/deliveries/{delivery_id}. The attempt history should show two retryable HTTP 500 responses followed by a successful HTTP 200. Stop the receiver with Ctrl+C. Use --fail-first 99 to drive a delivery to the configured dead-letter limit; replay it with POST /v1/deliveries/{delivery_id}/replay after changing or restarting the receiver. This receiver is for local development only.
+
+### Endpoint protection and isolation
+
+The API accepts only HTTP or HTTPS webhook URLs, rejects URL credentials and local or non-public IP destinations, and checks DNS results again in the worker immediately before delivery. HTTPX does not follow redirects. Private destinations are disabled by default. For a local-only receiver, set ALLOW_PRIVATE_WEBHOOK_TARGETS=true for both API and worker processes; keep it false for normal use.
+
+Per-endpoint distributed request limits use Redis and can be configured in the environment:
+
+- ENDPOINT_RATE_LIMIT_PER_SECOND (default 10; fixed one-second window)
+- ENDPOINT_CONCURRENCY_LIMIT (default 5; active request leases expire after the HTTP timeout plus a safety margin)
+- CIRCUIT_BREAKER_FAILURE_THRESHOLD (default 5 retryable failures)
+- CIRCUIT_BREAKER_COOLDOWN_SECONDS (default 30 seconds)
+
+The breaker pauses new attempts after the failure threshold, allows one half-open probe after the cooldown, closes after a successful probe, and reopens after another retryable failure. A limiter or open breaker reschedules the delivery through the outbox without counting a network attempt. DNS checks reduce SSRF exposure but do not pin the resolved address through the HTTP connection; production deployment should also enforce outbound network rules.
