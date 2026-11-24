@@ -30,6 +30,7 @@ from app.queue_config import (
     RETRY_BASE_SECONDS,
     RETRY_MAX_SECONDS,
 )
+from app.realtime import publish_delivery_update
 from app.security import decrypt_secret
 
 
@@ -109,6 +110,7 @@ def claim_delivery(delivery_id: UUID):
             "attempt_number": number,
             "url": ep.url,
             "endpoint_id": ep.id,
+            "tenant_id": ep.tenant_id,
             "event_id": ev.id,
             "producer_event_id": ev.producer_event_id,
             "event_type": ev.event_type,
@@ -117,6 +119,18 @@ def claim_delivery(delivery_id: UUID):
         }
 
 
+def _delivery_update(data, delivery):
+    return {
+        "tenant_id": str(data["tenant_id"]),
+        "type": "delivery.updated",
+        "delivery_id": str(delivery.id),
+        "event_id": str(delivery.event_id),
+        "endpoint_id": str(delivery.endpoint_id),
+        "status": delivery.status,
+        "attempt_count": delivery.attempt_count,
+        "last_status_code": delivery.last_status_code,
+        "updated_at": delivery.updated_at.isoformat() if delivery.updated_at else None,
+    }
 def finish(data, status_code, response_text, error, latency_ms):
     now = datetime.now(UTC)
     retryable = (
@@ -148,7 +162,7 @@ def finish(data, status_code, response_text, error, latency_ms):
             d.delivered_at = now
             if ep:
                 ep.consecutive_failures = 0
-            return
+            return _delivery_update(data, d)
         if ep:
             ep.consecutive_failures += 1
         if retryable and d.attempt_count < MAX_DELIVERY_ATTEMPTS:
@@ -205,6 +219,7 @@ def finish(data, status_code, response_text, error, latency_ms):
             "status_code": status_code,
         },
     )
+    return _delivery_update(data, d)
 
 
 @traced_job("webhook.delivery")
@@ -232,7 +247,7 @@ async def deliver_webhook(ctx, delivery_id: str):
         response = await ctx["http"].post(
             data["url"], content=data["body"], headers=headers
         )
-        await asyncio.to_thread(
+        update = await asyncio.to_thread(
             finish,
             data,
             response.status_code,
@@ -240,8 +255,10 @@ async def deliver_webhook(ctx, delivery_id: str):
             None,
             int((time.monotonic() - started) * 1000),
         )
+        if update is not None:
+            await publish_delivery_update(update["tenant_id"], update)
     except httpx.HTTPError as exc:
-        await asyncio.to_thread(
+        update = await asyncio.to_thread(
             finish,
             data,
             None,
@@ -249,6 +266,8 @@ async def deliver_webhook(ctx, delivery_id: str):
             f"{type(exc).__name__}: {exc}",
             int((time.monotonic() - started) * 1000),
         )
+        if update is not None:
+            await publish_delivery_update(update["tenant_id"], update)
 
 
 class WorkerSettings:

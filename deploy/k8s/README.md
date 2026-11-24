@@ -67,3 +67,10 @@ kubectl delete namespace webhook-engine
 ~~~
 
 This local setup has single-instance PostgreSQL and Redis, no TLS/ingress, no autoscaler, and development secrets managed in a Kubernetes Secret. Production deployment needs durable backups, managed stateful services, external secret management, network policy, and resource tuning.
+
+
+## Live delivery updates
+
+The API exposes tenant-scoped WebSockets at /v1/ws/deliveries. Connect to ws://127.0.0.1:8000/v1/ws/deliveries after port-forwarding, then send an initial JSON frame containing type=authenticate and the tenant API key. The server validates the key, subscribes to that tenant's Redis Pub/Sub channel, and replies with an authenticated frame. Worker status changes are published after the database transaction commits and are delivered to all connected API replicas.
+
+Keep the API key in the first WebSocket message; do not put it in the URL. Pub/Sub notifications are live best-effort updates, not a durable event log. After reconnecting, query the delivery status API to catch up on updates missed while disconnected.
