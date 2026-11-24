@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio
+import hashlib
+import hmac
 import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -7,6 +9,7 @@ import httpx
 from sqlalchemy import select
 from app.database import SessionLocal
 from app.models import Delivery, DeliveryAttempt, Event, OutboxMessage, WebhookEndpoint
+from app.security import decrypt_secret
 from app.queue_config import (HTTP_TIMEOUT_SECONDS, MAX_DELIVERY_ATTEMPTS,
                               REDIS_SETTINGS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS)
 
@@ -34,6 +37,16 @@ def claim_delivery(delivery_id: UUID):
             d.status = "paused"
             d.last_error = "Endpoint is not active"
             return None
+        if not ep.signing_secret_ciphertext:
+            d.status = "permanent_failure"
+            d.last_error = "Webhook signing secret is not configured"
+            return None
+        try:
+            signing_secret = decrypt_secret(ep.signing_secret_ciphertext)
+        except Exception:
+            d.status = "permanent_failure"
+            d.last_error = "Webhook signing secret could not be decrypted"
+            return None
         d.status = "processing"
         d.attempt_count += 1
         # attempt_count resets on manual replay; use historical max for globally unique attempt numbers.
@@ -47,7 +60,7 @@ def claim_delivery(delivery_id: UUID):
         return {"delivery_id": d.id, "attempt_id": attempt.id, "attempt_number": number,
                 "url": ep.url, "endpoint_id": ep.id, "event_id": ev.id,
                 "producer_event_id": ev.producer_event_id, "event_type": ev.event_type,
-                "body": ev.body_bytes}
+                "body": ev.body_bytes, "signing_secret": signing_secret}
 
 def finish(data, status_code, response_text, error, latency_ms):
     now = datetime.now(timezone.utc)
@@ -97,8 +110,11 @@ async def deliver_webhook(ctx, delivery_id: str):
     data = await asyncio.to_thread(claim_delivery, UUID(delivery_id))
     if not data:
         return
+    timestamp = str(int(time.time()))
+    signed_body = timestamp.encode("ascii") + b"." + data["body"]
+    digest = hmac.new(data["signing_secret"].encode("utf-8"), signed_body, hashlib.sha256).hexdigest()
     headers = {"Content-Type": "application/json", "User-Agent": "WebhookDeliveryEngine/0.1",
-               "X-Webhook-Delivery-Id": str(data["delivery_id"]),
+               "X-Webhook-Timestamp": timestamp, "X-Webhook-Signature": f"sha256={digest}",               "X-Webhook-Delivery-Id": str(data["delivery_id"]),
                "X-Webhook-Event-Id": data["producer_event_id"],
                "X-Webhook-Event-Type": data["event_type"],
                "X-Webhook-Attempt": str(data["attempt_number"])}

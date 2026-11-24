@@ -52,3 +52,7 @@ Run the API, worker, and publisher in three terminals from the repository root (
     python -m app.outbox_publisher
 
 Ensure PostgreSQL and Redis from docker compose up -d are running first. Configure MAX_DELIVERY_ATTEMPTS, HTTP_TIMEOUT_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS as needed.
+
+## Webhook request signing
+Each webhook endpoint must include a signing secret (at least 16 characters) when created, or set one through the endpoint update API. The service encrypts it in PostgreSQL with Fernet using WEBHOOK_ENCRYPTION_KEY. Generate a local key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" and set WEBHOOK_ENCRYPTION_KEY in your untracked .env file. Keep the same key across API and worker processes; losing or rotating it without re-encrypting stored secrets makes those secrets unreadable.
+Requests include X-Webhook-Timestamp and X-Webhook-Signature headers. The signature is sha256= plus the HMAC-SHA256 hex digest over timestamp, a dot, and the raw request body. Verify using constant-time comparison and reject stale timestamps at the receiver.

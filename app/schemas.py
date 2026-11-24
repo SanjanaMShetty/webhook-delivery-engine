@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 class EndpointCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     url: AnyHttpUrl
     event_types: list[str] = Field(min_length=1, max_length=100)
+
+    signing_secret: SecretStr = Field(min_length=16, max_length=256)
 
     @field_validator("name")
     @classmethod
@@ -35,6 +37,8 @@ class EndpointUpdate(BaseModel):
     url: AnyHttpUrl | None = None
     event_types: list[str] | None = Field(default=None, min_length=1, max_length=100)
     status: str | None = None
+
+    signing_secret: SecretStr | None = Field(default=None, min_length=16, max_length=256)
 
     @field_validator("name")
     @classmethod

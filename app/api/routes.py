@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import CurrentTenant
 from app.database import get_db
 from app.models import Delivery, Event, OutboxMessage, Tenant, WebhookEndpoint
+from app.security import encrypt_secret
 from app.schemas import EndpointCreate, EndpointRead, EndpointUpdate, EventAccepted, EventCreate
 
 router = APIRouter(prefix="/v1")
@@ -41,6 +42,7 @@ def create_endpoint(
         name=request.name,
         url=str(request.url),
         event_types=request.event_types,
+        signing_secret_ciphertext=encrypt_secret(request.signing_secret.get_secret_value()),
         status="active",
     )
     db.add(endpoint)
@@ -88,6 +90,9 @@ def update_endpoint(
     if endpoint is None:
         raise HTTPException(status_code=404, detail="Endpoint not found")
     changes = request.model_dump(exclude_unset=True)
+    signing_secret = changes.pop("signing_secret", None)
+    if signing_secret is not None:
+        changes["signing_secret_ciphertext"] = encrypt_secret(signing_secret.get_secret_value())
     if any(value is None for value in changes.values()):
         raise HTTPException(status_code=422, detail="Fields cannot be null")
     if not changes:
