@@ -1,0 +1,177 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-api
+  namespace: webhook-engine
+spec:
+  selector:
+    app: webhook-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-api
+  namespace: webhook-engine
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: webhook-api
+  template:
+    metadata:
+      labels:
+        app: webhook-api
+    spec:
+      terminationGracePeriodSeconds: 45
+      initContainers:
+        - name: wait-for-postgres
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["sh", "-c", "until python -c \"import socket; socket.create_connection(('postgres',5432),2).close()\"; do sleep 2; done"]
+      containers:
+        - name: api
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "30"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: webhook-engine-config
+            - secretRef:
+                name: webhook-engine-secrets
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 750m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-worker
+  namespace: webhook-engine
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: webhook-worker
+  template:
+    metadata:
+      labels:
+        app: webhook-worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: wait-for-dependencies
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["sh", "-c", "until python -c \"import socket; socket.create_connection(('postgres',5432),2).close(); socket.create_connection(('redis',6379),2).close()\"; do sleep 2; done"]
+      containers:
+        - name: worker
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["arq", "app.worker.WorkerSettings"]
+          envFrom:
+            - configMapRef:
+                name: webhook-engine-config
+            - secretRef:
+                name: webhook-engine-secrets
+          env:
+            - name: WORKER_METRICS_HOST
+              value: 0.0.0.0
+          ports:
+            - name: metrics
+              containerPort: 9101
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(('redis',6379)) == 0 else 1)"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-outbox-publisher
+  namespace: webhook-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-outbox-publisher
+  template:
+    metadata:
+      labels:
+        app: webhook-outbox-publisher
+    spec:
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: wait-for-dependencies
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["sh", "-c", "until python -c \"import socket; socket.create_connection(('postgres',5432),2).close(); socket.create_connection(('redis',6379),2).close()\"; do sleep 2; done"]
+      containers:
+        - name: publisher
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["python", "-m", "app.outbox_publisher"]
+          envFrom:
+            - configMapRef:
+                name: webhook-engine-config
+            - secretRef:
+                name: webhook-engine-secrets
+          env:
+            - name: OUTBOX_METRICS_HOST
+              value: 0.0.0.0
+          ports:
+            - name: metrics
+              containerPort: 9102
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi

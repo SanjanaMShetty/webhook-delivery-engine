@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: webhook-migrations
+  namespace: webhook-engine
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: webhook-migrations
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: alembic
+          image: webhook-delivery-engine:dev
+          imagePullPolicy: Never
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: webhook-engine-config
+            - secretRef:
+                name: webhook-engine-secrets

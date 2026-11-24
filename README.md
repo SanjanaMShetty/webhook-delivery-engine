@@ -118,3 +118,7 @@ docker compose start redis
 ```
 
 These are local development exercises. Avoid running the service-stop scenarios against shared or production data.
+
+## Local Kubernetes deployment
+
+Phase 8 deploys the API, ARQ workers, and outbox publisher as separate Kubernetes workloads, with PostgreSQL and Redis in the local cluster. Follow the build, migration, health-check, scaling, and cleanup steps in [deploy/k8s/README.md](deploy/k8s/README.md).

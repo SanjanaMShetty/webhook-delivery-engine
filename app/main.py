@@ -1,12 +1,14 @@
 import logging
 import time
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from sqlalchemy import text
 
 from app.api.routes import router as api_router
+from app.database import SessionLocal
 from app.observability import (
     REQUEST_ID,
     configure_logging,
@@ -58,3 +60,20 @@ def metrics() -> Response:
 @app.get("/health", tags=["operations"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/live", include_in_schema=False)
+async def health_live():
+    """Report that the API process is alive."""
+    return {"status": "alive"}
+
+
+@app.get("/health/ready", include_in_schema=False)
+async def health_ready():
+    """Report readiness only when PostgreSQL can serve requests."""
+    try:
+        with SessionLocal() as session:
+            session.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database unavailable") from exc
+    return {"status": "ready"}
