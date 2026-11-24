@@ -56,3 +56,12 @@ Ensure PostgreSQL and Redis from docker compose up -d are running first. Configu
 ## Webhook request signing
 Each webhook endpoint must include a signing secret (at least 16 characters) when created, or set one through the endpoint update API. The service encrypts it in PostgreSQL with Fernet using WEBHOOK_ENCRYPTION_KEY. Generate a local key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" and set WEBHOOK_ENCRYPTION_KEY in your untracked .env file. Keep the same key across API and worker processes; losing or rotating it without re-encrypting stored secrets makes those secrets unreadable.
 Requests include X-Webhook-Timestamp and X-Webhook-Signature headers. The signature is sha256= plus the HMAC-SHA256 hex digest over timestamp, a dot, and the raw request body. Verify using constant-time comparison and reject stale timestamps at the receiver.
+
+### Retry and dead-letter failure simulation
+
+Run a local receiver that returns HTTP 500 for its first two requests, then HTTP 200:
+
+    source .venv/bin/activate
+    python scripts/failure_receiver.py --port 9001 --fail-first 2 --status 500
+
+Register http://127.0.0.1:9001/webhook as an endpoint subscribed to the test event type. Publish an event and inspect it with GET /v1/deliveries/{delivery_id}. The attempt history should show two retryable HTTP 500 responses followed by a successful HTTP 200. Stop the receiver with Ctrl+C. Use --fail-first 99 to drive a delivery to the configured dead-letter limit; replay it with POST /v1/deliveries/{delivery_id}/replay after changing or restarting the receiver. This receiver is for local development only.
