@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import ClassVar
@@ -14,6 +15,14 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import Delivery, DeliveryAttempt, Event, OutboxMessage, WebhookEndpoint
+from app.observability import (
+    DELIVERY_ATTEMPTS,
+    DELIVERY_DURATION,
+    configure_logging,
+    configure_tracing,
+    start_worker_metrics,
+    traced_job,
+)
 from app.queue_config import (
     HTTP_TIMEOUT_SECONDS,
     MAX_DELIVERY_ATTEMPTS,
@@ -25,6 +34,12 @@ from app.security import decrypt_secret
 
 
 async def startup(ctx):
+    configure_logging()
+    configure_tracing("webhook-worker")
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    HTTPXClientInstrumentor().instrument()
+    start_worker_metrics()
     ctx["http"] = httpx.AsyncClient(
         timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False
     )
@@ -162,7 +177,37 @@ def finish(data, status_code, response_text, error, latency_ms):
             a.outcome = "permanent_failure"
             d.status = "permanent_failure"
 
+    succeeded = status_code is not None and 200 <= status_code < 300 and error is None
+    terminal_retry = retryable and data["attempt_number"] >= MAX_DELIVERY_ATTEMPTS
+    outcome = (
+        "succeeded"
+        if succeeded
+        else (
+            "dead"
+            if terminal_retry
+            else "retryable_failure"
+            if retryable
+            else "permanent_failure"
+        )
+    )
+    status_class = (
+        f"{status_code // 100}xx" if status_code is not None else "network_error"
+    )
+    DELIVERY_ATTEMPTS.labels(outcome=outcome, status_class=status_class).inc()
+    DELIVERY_DURATION.observe(max(latency_ms, 0) / 1000)
+    logging.getLogger("app.worker").info(
+        "webhook attempt completed",
+        extra={
+            "delivery_id": str(data["delivery_id"]),
+            "event_id": str(data["event_id"]),
+            "endpoint_id": str(data["endpoint_id"]),
+            "outcome": outcome,
+            "status_code": status_code,
+        },
+    )
 
+
+@traced_job("webhook.delivery")
 async def deliver_webhook(ctx, delivery_id: str):
     data = await asyncio.to_thread(claim_delivery, UUID(delivery_id))
     if not data:

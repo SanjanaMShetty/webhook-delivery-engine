@@ -78,3 +78,43 @@ Per-endpoint distributed request limits use Redis and can be configured in the e
 - CIRCUIT_BREAKER_COOLDOWN_SECONDS (default 30 seconds)
 
 The breaker pauses new attempts after the failure threshold, allows one half-open probe after the cooldown, closes after a successful probe, and reopens after another retryable failure. A limiter or open breaker reschedules the delivery through the outbox without counting a network attempt. DNS checks reduce SSRF exposure but do not pin the resolved address through the HTTP connection; production deployment should also enforce outbound network rules.
+
+## Analytics and operations
+
+The API exposes Prometheus metrics at /metrics. The ARQ worker and outbox publisher expose their process metrics on ports 9101 and 9102 by default. Each process has its own counters, so scrape all three targets to see HTTP, delivery-attempt, and outbox activity. The API metrics route is unauthenticated; restrict access to it and the worker/outbox metrics ports to your monitoring network when deploying. Metric labels use bounded values such as route templates and status classes; payloads, API keys, signing secrets, and destination URLs are never metric labels.
+
+Logs are JSON on stdout. API request logs include a request ID returned in the X-Request-ID response header; send your own safe correlation value with that header when debugging. Worker completion logs include delivery, event, and endpoint IDs. Request and response bodies are intentionally omitted.
+
+FastAPI request spans and HTTPX delivery spans are available through OpenTelemetry. The API and worker spans can be correlated by the delivery ID in worker spans and logs; the current version does not propagate a single trace across the durable outbox boundary. Traces are disabled for export by default. Set OTEL_EXPORTER_OTLP_ENDPOINT to an OpenTelemetry Collector endpoint to export OTLP/HTTP traces. For a local console demonstration, set OTEL_CONSOLE_TRACES=true before starting the API and worker.
+
+### Local observability checks
+
+With the API, worker, outbox publisher, PostgreSQL, and Redis running:
+
+```bash
+curl -i -H 'X-Request-ID: phase7-health-check' http://127.0.0.1:8000/health
+curl -sS http://127.0.0.1:8000/metrics | grep webhook_http_requests_total
+curl -sS http://127.0.0.1:9101/metrics | grep webhook_delivery_attempts_total
+curl -sS http://127.0.0.1:9102/metrics | grep webhook_outbox_published_total
+```
+
+The request should return the same request ID in its response header. After delivering a test event, the worker metrics should show attempt outcomes and the outbox metrics should show published records. Check terminal output for JSON request and attempt-completion logs.
+
+### Recovery scenarios
+
+Use the existing local failure receiver to make the first delivery return HTTP 500 and later requests succeed:
+
+```bash
+python scripts/failure_receiver.py --host 127.0.0.1 --port 9001 --fail-first 1 --status 500
+```
+
+In a second terminal, temporarily allow private webhook destinations in the local development environment, restart the API and worker, register an endpoint at http://127.0.0.1:9001/webhook, and submit an event. Confirm that attempt history records a retryable failure followed by success, and that worker metrics count both outcomes. Restore ALLOW_PRIVATE_WEBHOOK_TARGETS=false after the local simulation.
+
+For a worker restart scenario, stop the ARQ worker while an event is queued, submit an event, then start the worker again. The durable outbox republishes queued work. If the worker stopped during an active attempt, allow the lease recovery window (90 seconds) and confirm the delivery is retried or reaches its terminal state through the delivery status endpoint. For Redis recovery, stop and start the local Redis Compose service and confirm the outbox publisher resumes publishing pending records after Redis returns:
+
+```bash
+docker compose stop redis
+docker compose start redis
+```
+
+These are local development exercises. Avoid running the service-stop scenarios against shared or production data.
