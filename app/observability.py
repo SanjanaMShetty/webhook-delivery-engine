@@ -9,7 +9,7 @@ from functools import wraps
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from opentelemetry import trace
+from opentelemetry import propagate, trace
 from opentelemetry.trace import Status, StatusCode
 from prometheus_client import Counter, Histogram, start_http_server
 
@@ -110,8 +110,12 @@ def traced_job(
     def decorate(function: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         @wraps(function)
         async def wrapped(*args: Any, **kwargs: Any) -> T:
+            carrier = kwargs.get("trace_context")
+            if carrier is None and len(args) > 2:
+                carrier = args[2]
+            parent_context = propagate.extract(carrier or {})
             tracer = trace.get_tracer("webhook-delivery-engine")
-            with tracer.start_as_current_span(name) as span:
+            with tracer.start_as_current_span(name, context=parent_context) as span:
                 span.set_attribute("messaging.operation.type", "process")
                 if len(args) > 1:
                     span.set_attribute("webhook.delivery.id", str(args[1]))

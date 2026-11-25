@@ -23,6 +23,7 @@ if ! kubectl -n "$NAMESPACE" get configmap webhook-engine-config >/dev/null 2>&1
     --from-literal="CIRCUIT_BREAKER_FAILURE_THRESHOLD=5" \
     --from-literal="CIRCUIT_BREAKER_COOLDOWN_SECONDS=30" \
     --from-literal="LOG_LEVEL=INFO" \
+        --from-literal="OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318" \
     --from-literal="WORKER_METRICS_HOST=0.0.0.0" \
     --from-literal="WORKER_METRICS_PORT=9101" \
     --from-literal="OUTBOX_METRICS_HOST=0.0.0.0" \

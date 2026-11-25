@@ -122,3 +122,9 @@ These are local development exercises. Avoid running the service-stop scenarios 
 ## Local Kubernetes deployment
 
 Phase 8 deploys the API, ARQ workers, and outbox publisher as separate Kubernetes workloads, with PostgreSQL and Redis in the local cluster. Follow the build, migration, health-check, scaling, and cleanup steps in [deploy/k8s/README.md](deploy/k8s/README.md).
+
+## Distributed tracing
+
+The API, outbox publisher, and ARQ worker emit OpenTelemetry traces to Jaeger. The API writes W3C trace context into each outbox row in the same database transaction as its delivery record. The publisher continues that trace when it enqueues the ARQ job, and the worker continues it through the HTTPX webhook request. Structured logs include trace and span IDs for correlation. Jaeger is included for local development and uses in-memory storage, so traces disappear when its pod restarts.
+
+For the local Kubernetes viewer, run `kubectl -n webhook-engine port-forward svc/jaeger 16686:16686` and open <http://localhost:16686>. Services use `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` inside the cluster. Jaeger stores traces only; application logs remain in Kubernetes stdout and metrics remain available from the existing Prometheus metrics endpoints.

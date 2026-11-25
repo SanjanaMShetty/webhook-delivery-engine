@@ -74,3 +74,16 @@ This local setup has single-instance PostgreSQL and Redis, no TLS/ingress, no au
 The API exposes tenant-scoped WebSockets at /v1/ws/deliveries. Connect to ws://127.0.0.1:8000/v1/ws/deliveries after port-forwarding, then send an initial JSON frame containing type=authenticate and the tenant API key. The server validates the key, subscribes to that tenant's Redis Pub/Sub channel, and replies with an authenticated frame. Worker status changes are published after the database transaction commits and are delivered to all connected API replicas.
 
 Keep the API key in the first WebSocket message; do not put it in the URL. Pub/Sub notifications are live best-effort updates, not a durable event log. After reconnecting, query the delivery status API to catch up on updates missed while disconnected.
+
+## OpenTelemetry traces
+
+The Kustomize resources include a local Jaeger all-in-one pod and service. The API, outbox publisher, and worker send OTLP/HTTP traces to `http://jaeger:4318`. The development ConfigMap script sets `OTEL_EXPORTER_OTLP_ENDPOINT` for new local clusters. For an existing cluster, update the ConfigMap and restart the three app deployments after applying the Jaeger resource:
+
+```bash
+kubectl apply -f deploy/k8s/jaeger.yaml
+kubectl -n webhook-engine patch configmap webhook-engine-config --type merge -p '{"data":{"OTEL_EXPORTER_OTLP_ENDPOINT":"http://jaeger:4318"}}'
+kubectl -n webhook-engine rollout restart deployment/webhook-api deployment/webhook-worker deployment/webhook-outbox-publisher
+kubectl -n webhook-engine port-forward svc/jaeger 16686:16686
+```
+
+Open <http://localhost:16686>, select `webhook-api`, and search for a recent `POST /v1/events` trace. The trace should continue through `outbox.publish`, `webhook.delivery`, and an HTTPX client span. Jaeger uses transient in-memory storage for this development setup, so traces are cleared when the Jaeger pod restarts. Logs remain in pod stdout; correlate them by `trace_id` and `span_id`.

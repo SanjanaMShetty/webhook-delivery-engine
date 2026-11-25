@@ -5,6 +5,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from opentelemetry import propagate
 from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -231,13 +232,21 @@ async def ingest_event(
         ).all()
 
         delivery_ids: list[UUID] = []
+        trace_context: dict[str, str] = {}
+        propagate.inject(trace_context)
         for endpoint in endpoints:
             delivery = Delivery(
                 event_id=event_id, endpoint_id=endpoint.id, status="queued"
             )
             db.add(delivery)
             db.flush()
-            db.add(OutboxMessage(delivery_id=delivery.id, status="pending"))
+            db.add(
+                OutboxMessage(
+                    delivery_id=delivery.id,
+                    status="pending",
+                    trace_context=trace_context,
+                )
+            )
             delivery_ids.append(delivery.id)
 
     return EventAccepted(

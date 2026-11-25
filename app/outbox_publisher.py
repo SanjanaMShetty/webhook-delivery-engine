@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from arq import create_pool
+from opentelemetry import propagate, trace
 from sqlalchemy import or_, select
 
 from app.database import SessionLocal
@@ -16,6 +17,7 @@ from app.observability import (
     OUTBOX_PUBLISHED,
     OUTBOX_RECOVERED,
     configure_logging,
+    configure_tracing,
     start_metrics_server,
 )
 from app.queue_config import REDIS_SETTINGS
@@ -49,7 +51,7 @@ def claim_batch(limit: int = 50):
             row.lease_expires_at = now + timedelta(seconds=60)
             row.publish_attempts += 1
             claimed.append(
-                (str(row.id), str(row.delivery_id), str(token), row.publish_attempts)
+                (str(row.id), str(row.delivery_id), str(token), row.publish_attempts, row.trace_context)
             )
     return claimed
 
@@ -105,14 +107,23 @@ def recover_stale():
 
 async def publish_once(redis):
     recover_stale()
-    for outbox_id, delivery_id, token, publish_attempt in claim_batch():
+    for outbox_id, delivery_id, token, publish_attempt, trace_context in claim_batch():
         try:
             # Deterministic job IDs make redelivery after a publisher crash safe.
-            await redis.enqueue_job(
-                "deliver_webhook",
-                delivery_id,
-                _job_id=f"delivery:{delivery_id}:publish:{publish_attempt}",
-            )
+            parent_context = propagate.extract(trace_context or {})
+            with trace.get_tracer("webhook-outbox-publisher").start_as_current_span(
+                "outbox.publish", context=parent_context
+            ) as span:
+                span.set_attribute("webhook.delivery.id", delivery_id)
+                span.set_attribute("webhook.outbox.id", outbox_id)
+                job_trace_context: dict[str, str] = {}
+                propagate.inject(job_trace_context)
+                await redis.enqueue_job(
+                    "deliver_webhook",
+                    delivery_id,
+                    job_trace_context,
+                    _job_id=f"delivery:{delivery_id}:publish:{publish_attempt}",
+                )
             with SessionLocal.begin() as db:
                 row = db.get(OutboxMessage, outbox_id)
                 if row and str(row.lease_token) == token:
@@ -135,6 +146,7 @@ async def publish_once(redis):
 
 async def main():
     configure_logging()
+    configure_tracing("webhook-outbox-publisher")
     start_metrics_server(
         int(os.getenv("OUTBOX_METRICS_PORT", "9102")),
         os.getenv("OUTBOX_METRICS_HOST", "127.0.0.1"),
@@ -146,6 +158,7 @@ async def main():
             await asyncio.sleep(1)
     finally:
         await redis.aclose()
+        trace.get_tracer_provider().force_flush()
 
 
 if __name__ == "__main__":

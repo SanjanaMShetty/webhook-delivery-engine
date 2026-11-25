@@ -11,6 +11,8 @@ from uuid import UUID
 
 import httpx
 from cryptography.fernet import InvalidToken
+from opentelemetry import trace
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from sqlalchemy import select
 
 from app.database import SessionLocal
@@ -37,7 +39,6 @@ from app.security import decrypt_secret
 async def startup(ctx):
     configure_logging()
     configure_tracing("webhook-worker")
-    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
     HTTPXClientInstrumentor().instrument()
     start_worker_metrics()
@@ -48,6 +49,7 @@ async def startup(ctx):
 
 async def shutdown(ctx):
     await ctx["http"].aclose()
+    trace.get_tracer_provider().force_flush()
 
 
 def claim_delivery(delivery_id: UUID):
@@ -223,7 +225,7 @@ def finish(data, status_code, response_text, error, latency_ms):
 
 
 @traced_job("webhook.delivery")
-async def deliver_webhook(ctx, delivery_id: str):
+async def deliver_webhook(ctx, delivery_id: str, trace_context: dict[str, str] | None = None):
     data = await asyncio.to_thread(claim_delivery, UUID(delivery_id))
     if not data:
         return
