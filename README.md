@@ -1,130 +1,284 @@
+# Webhook Delivery Engine
 
-## Phase 2: tenant API, endpoints, and event ingestion
+A multi-tenant webhook delivery service built as a portfolio project to explore reliable asynchronous processing, failure recovery, and cloud-native operations.
 
-The API uses tenant-scoped bearer API keys. Create a local tenant and key after applying migrations:
+**Python · FastAPI · PostgreSQL · SQLAlchemy · Alembic · Redis · ARQ · HTTPX · HMAC-SHA256 · Docker · Kubernetes · OpenTelemetry**
+
+## Overview
+
+Applications publish events once. The engine finds active endpoints subscribed to each event type, creates a delivery for every match, and sends signed HTTP requests asynchronously. It records each attempt and supports retry, dead-letter handling, and manual replay.
+
+The project focuses on practical distributed-systems concerns: a transactional outbox between PostgreSQL and Redis, at-least-once delivery, tenant isolation, endpoint protection, and trace correlation across the queue boundary.
+
+## Architecture
+
+~~~mermaid
+flowchart LR
+    Producer -->|Bearer API key| API[FastAPI]
+    API -->|one transaction| DB[(PostgreSQL)]
+    DB --> Events[Events and deliveries]
+    DB --> Outbox[Transactional outbox]
+    Outbox --> Publisher[Outbox publisher]
+    Publisher -->|enqueue| Queue[(Redis and ARQ)]
+    Queue --> Worker[Delivery worker]
+    Worker -->|HTTP POST with HMAC| Endpoint[Subscriber endpoint]
+    Worker -->|attempts and status| DB
+    API --> WS[WebSocket clients]
+    API -->|OTLP traces| Jaeger[Jaeger]
+    Publisher -->|OTLP traces| Jaeger
+    Worker -->|OTLP traces| Jaeger
+~~~
+
+The API documentation is available at /docs while the API is running.
+
+## One event, end to end
+
+A producer sends one authenticated `POST /v1/events` request. The webhook calls happen asynchronously, so event acceptance does not wait for every receiver to respond.
+
+1. **Authenticate and validate.** FastAPI checks the tenant API key and validates the event body.
+2. **Deduplicate and fan out.** The engine uses the event ID to detect a repeated submission, then finds active endpoints subscribed to the event type (including wildcard subscriptions).
+3. **Commit durable work.** PostgreSQL stores the event, one delivery per matching endpoint, and corresponding outbox rows in a single transaction. The API returns the event ID and delivery IDs.
+4. **Queue each delivery.** The outbox publisher claims pending rows and enqueues ARQ jobs in Redis. If publishing is interrupted, uncompleted outbox rows can be picked up again.
+5. **Send the webhook.** An ARQ worker loads the delivery, signs the request with the endpoint's HMAC secret, and sends it with HTTPX.
+6. **Record and report the outcome.** The worker stores the attempt and delivery status in PostgreSQL. Retryable failures are scheduled with backoff; exhausted deliveries become dead. Status changes are published through Redis Pub/Sub to connected WebSocket clients.
+
+Follow a delivery with `GET /v1/deliveries/{delivery_id}`. The API also exposes metrics at `/metrics`, while OpenTelemetry traces can be explored in Jaeger when the local observability stack is running.
+
+## Features
+
+| Area | What is implemented |
+|---|---|
+| Event ingestion | Tenant-scoped bearer API keys, request validation, and event idempotency |
+| Fan-out | Match event types to active endpoints, including wildcard subscriptions |
+| Durable queueing | Write events, deliveries, and outbox messages in one PostgreSQL transaction; publish outbox work to Redis/ARQ |
+| Delivery | ARQ worker sends HTTP POST requests with HTTPX and signs requests with HMAC-SHA256 |
+| Reliability | Bounded retries with backoff, dead-letter state, delivery history, and manual replay |
+| Protection | Destination URL checks, per-endpoint rate and concurrency limits, and a circuit breaker |
+| Operations | Health and status APIs, Prometheus metrics, structured logs, WebSocket delivery updates, and OpenTelemetry traces |
+
+## Delivery lifecycle
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> delivering
+    delivering --> delivered: HTTP success
+    delivering --> retrying: retryable failure
+    retrying --> delivering: backoff elapsed
+    delivering --> dead: attempts exhausted
+    dead --> queued: manual replay
+~~~
+
+Delivery is **at least once**. If a receiver processes a request but the worker cannot record the response, a retry may send it again. Receivers should be idempotent.
+
+## Technology choices
+
+| Technology | Role |
+|---|---|
+| [FastAPI](https://fastapi.tiangolo.com/) | Async HTTP API, validation integration, and OpenAPI docs |
+| [PostgreSQL](https://www.postgresql.org/docs/) | Durable source of truth for tenants, keys, events, endpoints, deliveries, attempts, and outbox records |
+| [SQLAlchemy](https://docs.sqlalchemy.org/en/21/) + [Alembic](https://alembic.sqlalchemy.org/en/latest/) | Database access and versioned schema migrations |
+| [Redis](https://redis.io/docs/latest/) + [ARQ](https://arq-docs.helpmanual.io/) | Background job queue and cross-instance WebSocket Pub/Sub |
+| [HTTPX](https://www.python-httpx.org/) | Async outbound webhook requests |
+| [HMAC-SHA256](https://www.rfc-editor.org/rfc/rfc2104) | Sign webhook requests so receivers can verify their origin and integrity |
+| [Docker Compose](https://docs.docker.com/compose/) | Run [PostgreSQL](https://www.postgresql.org/docs/) and [Redis](https://redis.io/docs/latest/) for local development |
+| [Kubernetes](https://kubernetes.io/docs/) (kind) | Run the API, worker, and outbox publisher as separate workloads |
+| [OpenTelemetry](https://opentelemetry.io/docs/languages/python/) + [Jaeger](https://www.jaegertracing.io/docs/) | Create, propagate, export, and inspect distributed traces |
+| [Prometheus](https://prometheus.io/docs/introduction/overview/) + [Ruff](https://docs.astral.sh/ruff/) + [GitHub Actions](https://docs.github.com/en/actions) | Metrics endpoint, linting, and CI checks |
+
+## Quick start: local development
+
+### Prerequisites
+
+- Python 3.13 or newer
+- Docker Desktop with Docker Compose
+- Git
+
+### 1. Clone and prepare Python
+
+~~~bash
+git clone <your-repository-url>
+cd webhook-delivery-engine
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+~~~
+
+Set WEBHOOK_ENCRYPTION_KEY in .env to a Fernet key. Generate one with:
+
+~~~bash
+python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+~~~
+
+Keep .env private and do not commit it.
+
+### 2. Start PostgreSQL and Redis
+
+~~~bash
+docker compose up -d postgres redis
+~~~
+
+Apply the schema migrations:
+
+~~~bash
+alembic upgrade head
+~~~
+
+### 3. Create a local tenant and API key
+
+The script creates a tenant and prints a new API key once. Save it privately. The database stores a hash, so the original key cannot be retrieved later.
 
 ~~~bash
 python -m scripts.create_tenant "Local Demo"
+read -rsp "Paste the one-time API key: " WEBHOOK_API_KEY; echo
+export WEBHOOK_API_KEY
 ~~~
 
-Copy the one-time key from the terminal and keep it private. In that same WSL terminal, set it for your current shell session:
+### 4. Start the API and background processes
+
+Run each process in a separate terminal from the project directory, with the virtual environment activated.
 
 ~~~bash
-export WEBHOOK_API_KEY='paste-the-key-here'
-~~~
-
-Run the API:
-
-~~~bash
+# Terminal 1: API
 uvicorn app.main:app --reload
 ~~~
 
-Open <http://127.0.0.1:8000/docs> for the interactive API reference. Register an endpoint (use a receiver URL you control):
-
 ~~~bash
-curl -X POST http://127.0.0.1:8000/v1/endpoints \
-  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Order receiver","url":"https://example.com/webhook","event_types":["order.created"]}'
+# Terminal 2: ARQ delivery worker
+arq app.worker.WorkerSettings
 ~~~
 
-Submit an event:
-
 ~~~bash
-curl -X POST http://127.0.0.1:8000/v1/events \
-  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"event_id":"evt-001","event_type":"order.created","payload":{"order_id":"ord-123"}}'
+# Terminal 3: transactional outbox publisher
+python -m app.outbox_publisher
 ~~~
 
-A successful request stores the event and, for each active matching endpoint, creates a queued delivery and its pending PostgreSQL outbox row in the same transaction. Repeating the same event_id and body returns the existing event and delivery IDs; reusing that ID with different event content returns HTTP 409. The background publisher and delivery worker are implemented in later phases.
+Open http://127.0.0.1:8000/docs for interactive API documentation. The local API health endpoint is http://127.0.0.1:8000/health.
 
-For local development, endpoint registration currently accepts HTTP and HTTPS URLs, and event types may include * to subscribe to all event types. Outbound URL safety checks and encrypted signing-secret management are later security/delivery work; do not use untrusted URLs or store signing secrets yet.
+### 5. Send a test webhook
 
-## Phase 3: durable webhook delivery
+For a local receiver, use the included failure receiver in another terminal:
 
-The PostgreSQL outbox publisher leases due rows with SKIP LOCKED and enqueues deterministic ARQ job IDs. The ARQ worker posts the stored event bytes over HTTP, persists each attempt, and schedules exponential retries through the outbox. Transient network errors, HTTP 408/425/429 and 5xx responses are retried; other non-2xx responses become permanent failures. Exhausted retries become dead. POST /v1/deliveries/{delivery_id}/replay starts a fresh retry budget while retaining prior attempt history. Workers and publisher are separate processes.
+~~~bash
+python scripts/failure_receiver.py --host 127.0.0.1 --port 9001 --fail-first 0 --status 200
+~~~
 
-Run the API, worker, and publisher in three terminals from the repository root (activate .venv in each):
+Because this receiver uses a private local address, set ALLOW_PRIVATE_WEBHOOK_TARGETS=true in .env for local development only, then restart both the API and worker. Keep this setting disabled outside local testing.
 
-    uvicorn app.main:app --reload
-    arq app.worker.WorkerSettings
-    python -m app.outbox_publisher
+Register an endpoint. The signing secret must be at least 16 characters:
 
-Ensure PostgreSQL and Redis from docker compose up -d are running first. Configure MAX_DELIVERY_ATTEMPTS, HTTP_TIMEOUT_SECONDS, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS as needed.
+~~~bash
+curl -sS -X POST http://127.0.0.1:8000/v1/endpoints \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Local receiver","url":"http://127.0.0.1:9001/webhook","event_types":["order.created"],"signing_secret":"local-test-signing-secret-2026"}'
+~~~
 
-## Webhook request signing
-Each webhook endpoint must include a signing secret (at least 16 characters) when created, or set one through the endpoint update API. The service encrypts it in PostgreSQL with Fernet using WEBHOOK_ENCRYPTION_KEY. Generate a local key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" and set WEBHOOK_ENCRYPTION_KEY in your untracked .env file. Keep the same key across API and worker processes; losing or rotating it without re-encrypting stored secrets makes those secrets unreadable.
-Requests include X-Webhook-Timestamp and X-Webhook-Signature headers. The signature is sha256= plus the HMAC-SHA256 hex digest over timestamp, a dot, and the raw request body. Verify using constant-time comparison and reject stale timestamps at the receiver.
+Submit an event with a unique event ID:
 
-### Retry and dead-letter failure simulation
+~~~bash
+EVENT_ID="demo-$(python -c 'import uuid; print(uuid.uuid4())')"
+curl -sS -X POST http://127.0.0.1:8000/v1/events \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"event_id\":\"$EVENT_ID\",\"event_type\":\"order.created\",\"payload\":{\"order_id\":\"$EVENT_ID\",\"amount\":42}}"
+~~~
 
-Run a local receiver that returns HTTP 500 for its first two requests, then HTTP 200:
+The response includes delivery IDs for matched endpoints. Use one to inspect its status and attempt history:
 
-    source .venv/bin/activate
-    python scripts/failure_receiver.py --port 9001 --fail-first 2 --status 500
+~~~bash
+export DELIVERY_ID="<delivery_id from the event response>"
+curl -sS "http://127.0.0.1:8000/v1/deliveries/$DELIVERY_ID" \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY"
+~~~
 
-Register http://127.0.0.1:9001/webhook as an endpoint subscribed to the test event type. Publish an event and inspect it with GET /v1/deliveries/{delivery_id}. The attempt history should show two retryable HTTP 500 responses followed by a successful HTTP 200. Stop the receiver with Ctrl+C. Use --fail-first 99 to drive a delivery to the configured dead-letter limit; replay it with POST /v1/deliveries/{delivery_id}/replay after changing or restarting the receiver. This receiver is for local development only.
+A replay can be requested for an eligible failed delivery:
 
-### Endpoint protection and isolation
+~~~bash
+curl -sS -X POST "http://127.0.0.1:8000/v1/deliveries/$DELIVERY_ID/replay" \
+  -H "Authorization: Bearer $WEBHOOK_API_KEY"
+~~~
 
-The API accepts only HTTP or HTTPS webhook URLs, rejects URL credentials and local or non-public IP destinations, and checks DNS results again in the worker immediately before delivery. HTTPX does not follow redirects. Private destinations are disabled by default. For a local-only receiver, set ALLOW_PRIVATE_WEBHOOK_TARGETS=true for both API and worker processes; keep it false for normal use.
+## API reference
 
-Per-endpoint distributed request limits use Redis and can be configured in the environment:
+All tenant-protected routes use a bearer API key:
 
-- ENDPOINT_RATE_LIMIT_PER_SECOND (default 10; fixed one-second window)
-- ENDPOINT_CONCURRENCY_LIMIT (default 5; active request leases expire after the HTTP timeout plus a safety margin)
-- CIRCUIT_BREAKER_FAILURE_THRESHOLD (default 5 retryable failures)
-- CIRCUIT_BREAKER_COOLDOWN_SECONDS (default 30 seconds)
+~~~http
+Authorization: Bearer <tenant-api-key>
+~~~
 
-The breaker pauses new attempts after the failure threshold, allows one half-open probe after the cooldown, closes after a successful probe, and reopens after another retryable failure. A limiter or open breaker reschedules the delivery through the outbox without counting a network attempt. DNS checks reduce SSRF exposure but do not pin the resolved address through the HTTP connection; production deployment should also enforce outbound network rules.
+| Method | Route | Purpose |
+|---|---|---|
+| POST | /v1/endpoints | Register a webhook endpoint |
+| GET | /v1/endpoints | List tenant endpoints |
+| GET | /v1/endpoints/{endpoint_id} | Read an endpoint |
+| PATCH | /v1/endpoints/{endpoint_id} | Update endpoint settings |
+| DELETE | /v1/endpoints/{endpoint_id} | Disable an endpoint |
+| POST | /v1/events | Accept an event and create matched deliveries |
+| GET | /v1/events/{event_id} | Read event details and delivery status |
+| GET | /v1/deliveries/{delivery_id} | Read delivery status and attempt history |
+| POST | /v1/deliveries/{delivery_id}/replay | Replay an eligible failed delivery |
+| GET | /health/live | Liveness check |
+| GET | /health/ready | Readiness check |
+| GET | /metrics | API Prometheus metrics |
+| WS | /v1/ws/deliveries | Tenant-authenticated live delivery updates |
 
-## Analytics and operations
+The endpoint event_types list accepts explicit event names and the wildcard * subscription. See /docs for request and response schemas.
 
-The API exposes Prometheus metrics at /metrics. The ARQ worker and outbox publisher expose their process metrics on ports 9101 and 9102 by default. Each process has its own counters, so scrape all three targets to see HTTP, delivery-attempt, and outbox activity. The API metrics route is unauthenticated; restrict access to it and the worker/outbox metrics ports to your monitoring network when deploying. Metric labels use bounded values such as route templates and status classes; payloads, API keys, signing secrets, and destination URLs are never metric labels.
+## Request signing
 
-Logs are JSON on stdout. API request logs include a request ID returned in the X-Request-ID response header; send your own safe correlation value with that header when debugging. Worker completion logs include delivery, event, and endpoint IDs. Request and response bodies are intentionally omitted.
+Webhook requests include a signature header generated with the endpoint's signing secret. Receivers should verify the signature against the raw request body and reject invalid signatures. Do not log or expose signing secrets. The test receiver is for local development; it does not demonstrate receiver-side signature verification.
 
-FastAPI request spans and HTTPX delivery spans are available through OpenTelemetry. The API and worker spans can be correlated by the delivery ID in worker spans and logs; the current version does not propagate a single trace across the durable outbox boundary. Traces are disabled for export by default. Set OTEL_EXPORTER_OTLP_ENDPOINT to an OpenTelemetry Collector endpoint to export OTLP/HTTP traces. For a local console demonstration, set OTEL_CONSOLE_TRACES=true before starting the API and worker.
+## Observability
 
-### Local observability checks
+The API, outbox publisher, and delivery worker emit OpenTelemetry traces. Trace context is persisted with each outbox record and propagated through ARQ, allowing an event's API span, publisher span, worker span, and outbound HTTPX span to be inspected as one trace.
 
-With the API, worker, outbox publisher, PostgreSQL, and Redis running:
+- In the local Kubernetes setup, Jaeger receives OTLP traces. Follow the setup and port-forward steps indeploy/k8s/README.md, then open http://localhost:16686.
+- Search for the webhook-api service and open a recent event trace.
+- Metrics are exposed through Prometheus endpoints. Logs are structured JSON on standard output and include trace and span IDs for correlation.
+- The development Jaeger instance uses in-memory storage; its traces disappear when it restarts. Kubernetes logs remain available through kubectl logs.
 
-```bash
-curl -i -H 'X-Request-ID: phase7-health-check' http://127.0.0.1:8000/health
-curl -sS http://127.0.0.1:8000/metrics | grep webhook_http_requests_total
-curl -sS http://127.0.0.1:9101/metrics | grep webhook_delivery_attempts_total
-curl -sS http://127.0.0.1:9102/metrics | grep webhook_outbox_published_total
-```
+## Kubernetes deployment
 
-The request should return the same request ID in its response header. After delivering a test event, the worker metrics should show attempt outcomes and the outbox metrics should show published records. Check terminal output for JSON request and attempt-completion logs.
+The local kind deployment runs PostgreSQL, Redis, the API, ARQ workers, the outbox publisher, and Jaeger. The API and background processes run as separate Kubernetes workloads. This is a learning and demo setup, not a production-hardened deployment.
 
-### Recovery scenarios
+See [deploy/k8s/README.md](deploy/k8s/README.md) for cluster creation, secrets, image loading, migrations, health checks, scaling, WebSocket updates, tracing, and cleanup instructions.
 
-Use the existing local failure receiver to make the first delivery return HTTP 500 and later requests succeed:
+## Data model
 
-```bash
-python scripts/failure_receiver.py --host 127.0.0.1 --port 9001 --fail-first 1 --status 500
-```
+- Tenant and API key: isolate clients and authenticate their requests; only a key hash is stored.
+- Endpoint: destination URL, event subscriptions, status, and encrypted signing secret.
+- Event: accepted producer event and payload.
+- Delivery: one event-to-endpoint work item and its current state.
+- DeliveryAttempt: outcome, response status, timing, and error for each attempt.
+- OutboxMessage: durable handoff from a committed PostgreSQL transaction to ARQ.
 
-In a second terminal, temporarily allow private webhook destinations in the local development environment, restart the API and worker, register an endpoint at http://127.0.0.1:9001/webhook, and submit an event. Confirm that attempt history records a retryable failure followed by success, and that worker metrics count both outcomes. Restore ALLOW_PRIVATE_WEBHOOK_TARGETS=false after the local simulation.
+## Project structure
 
-For a worker restart scenario, stop the ARQ worker while an event is queued, submit an event, then start the worker again. The durable outbox republishes queued work. If the worker stopped during an active attempt, allow the lease recovery window (90 seconds) and confirm the delivery is retried or reaches its terminal state through the delivery status endpoint. For Redis recovery, stop and start the local Redis Compose service and confirm the outbox publisher resumes publishing pending records after Redis returns:
+~~~text
+app/
+  api/                  FastAPI routes and authentication
+  models.py             SQLAlchemy models
+  observability.py      OpenTelemetry and structured logging setup
+  outbox_publisher.py   PostgreSQL outbox to ARQ publisher
+  worker.py             Async webhook delivery worker
+  realtime.py           WebSocket delivery updates
+migrations/             Alembic schema history
+scripts/                Tenant setup and local failure receiver
+deploy/k8s/            kind and Kubernetes manifests and guide
+~~~
 
-```bash
-docker compose stop redis
-docker compose start redis
-```
+## Tradeoffs and guarantees
 
-These are local development exercises. Avoid running the service-stop scenarios against shared or production data.
+- **At-least-once delivery:** retries and worker recovery can cause duplicate requests; exactly-once delivery to arbitrary HTTP receivers is not promised.
+- **PostgreSQL is authoritative:** Redis/ARQ moves work efficiently, while the outbox allows pending work to be republished after queue interruptions.
+- **Local-first operations:** kind and in-memory Jaeger make the project easy to run, but are not substitutes for production secrets management, persistent telemetry storage, or cloud availability planning.
+- **Outbound URL checks have limits:** DNS checks reduce SSRF exposure, but production should also enforce outbound network policy and prevent DNS rebinding.
 
-## Local Kubernetes deployment
+## Future improvements
 
-Phase 8 deploys the API, ARQ workers, and outbox publisher as separate Kubernetes workloads, with PostgreSQL and Redis in the local cluster. Follow the build, migration, health-check, scaling, and cleanup steps in [deploy/k8s/README.md](deploy/k8s/README.md).
-
-## Distributed tracing
-
-The API, outbox publisher, and ARQ worker emit OpenTelemetry traces to Jaeger. The API writes W3C trace context into each outbox row in the same database transaction as its delivery record. The publisher continues that trace when it enqueues the ARQ job, and the worker continues it through the HTTPX webhook request. Structured logs include trace and span IDs for correlation. Jaeger is included for local development and uses in-memory storage, so traces disappear when its pod restarts.
-
-For the local Kubernetes viewer, run `kubectl -n webhook-engine port-forward svc/jaeger 16686:16686` and open <http://localhost:16686>. Services use `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` inside the cluster. Jaeger stores traces only; application logs remain in Kubernetes stdout and metrics remain available from the existing Prometheus metrics endpoints.
+- Add measured load and recovery benchmarks, including duplicate-delivery behavior.
+- Use persistent trace storage and an OpenTelemetry Collector for multi-signal routing.
+- Add tenant quotas, operator tooling for dead-letter inspection, and stronger production network controls.
+- Add deployment automation and verify behavior under multi-node and database-failure scenarios.
